@@ -38,6 +38,9 @@ let g:asynctasks_profile = get(g:, 'asynctasks_profile', 'debug')
 " local config
 let g:asynctasks_config_name = get(g:, 'asynctasks_config_name', '.tasks')
 
+" local vscode config
+let g:asynctasks_vscode_config_name = get(g:, 'asynctasks_vscode_config_name', '.vscode/tasks.json')
+
 " global config in every runtimepath
 let g:asynctasks_rtp_config = get(g:, 'asynctasks_rtp_config', 'tasks.ini')
 
@@ -126,7 +129,7 @@ let g:asyncrun_skip = 1
 "----------------------------------------------------------------------
 " internal object
 "----------------------------------------------------------------------
-let s:private = { 'cache':{}, 'rtp':{}, 'local':{}, 'tasks':{} }
+let s:private = { 'cache':{}, 'rtp':{}, 'local':{}, 'local_vscode': {}, 'tasks':{} }
 let s:error = ''
 let s:index = 0
 
@@ -220,6 +223,30 @@ function! s:readini(source)
 		endif
 	endfor
 	return sections
+endfunc
+
+function! s:readjson(source)
+	if type(a:source) == type('')
+		if !filereadable(a:source)
+			return -1
+		endif
+		let content = readfile(a:source)
+	elseif type(a:source) == type([])
+		let content = a:source
+	else
+		return -2
+	endif
+  let jsonstring = ''
+  for line in content
+    " Remove JSONC comments
+    if line =~ '^\s*\/\/'
+      continue
+    endif
+    let line = substitute(line, '\s+', '\s', '')
+    let jsonstring = jsonstring . line
+  endfor
+  let obj = json_decode(jsonstring)
+  return obj
 endfunc
 
 " returns nearest parent directory contains one of the markers
@@ -384,6 +411,81 @@ function! s:cache_load_ini(name)
 	return obj
 endfunc
 
+function! s:cache_load_vscode_tasks_json(name)
+	let name = (stridx(a:name, '~') >= 0)? expand(a:name) : a:name
+	let name = s:abspath(name)
+	let p1 = name
+	if s:windows || has('win32unix')
+		let p1 = tr(tolower(p1), "\\", '/')
+	endif
+	let ts = getftime(name)
+	if ts < 0
+		let s:error = 'cannot load ' . a:name
+		return -1
+	endif
+	if has_key(s:private.cache, p1)
+		let obj = s:private.cache[p1]
+		if ts <= obj.ts
+			return obj
+		endif
+	endif
+	let vscode_config = s:readjson(name)
+	if type(vscode_config) != v:t_dict
+		let s:error = 'syntax error in '. a:name . ' line '. vscode_config
+		return vscode_config
+	endif
+
+  " Transform VSCode task array into key-value pairs to conform to
+  " tasks.ini format
+  let vscode_tasks = vscode_config['tasks']
+  let config = {}
+  for entry in vscode_tasks
+    " An incredibly rudimentary transform from title-case to something
+    " easier to work-with via the search functionality.
+    let label = tolower(join(split(entry['label'], ' '), '-'))
+    let label = s:replace(label, '(', '')
+    let label = s:replace(label, ')', '')
+
+    let config[label] = {}
+    let config[label]['command'] = entry['command']
+    " For now we assume output will always be in the terminal
+    let config[label]['output'] = 'terminal'
+  endfor
+
+  let s:private.cache[p1] = {}
+  let obj = s:private.cache[p1]
+  let obj.ts = ts
+  let obj.config = config
+  let obj.keys = keys(config)
+  let ininame = name
+  let inihome = fnamemodify(name, ':h')
+  for sect in obj.keys
+    let section = obj.config[sect]
+      for key in keys(section)
+      let val = section[key]
+
+      " Translate VSCode tasks vars to asynctasks vars
+      " @see https://code.visualstudio.com/docs/editor/variables-reference#_predefined-variables
+      let val = s:replace(val, '${workspaceFolder}', '$(VIM_ROOT)')
+      let val = s:replace(val, '${workspaceFolderBasename}', '$(VIM_PRONAME)')
+      let val = s:replace(val, '${file}', '$(VIM_FILEPATH)')
+      let val = s:replace(val, '${relativeFile}', '$(VIM_RELNAME)')
+      let val = s:replace(val, '${relativeFileDirname}', '$(VIM_RELDIR)')
+      let val = s:replace(val, '${fileBasename}', '$(VIM_FILENAME)')
+      let val = s:replace(val, '${fileBasenameNoExtension}', '$(VIM_FILENOEXT)')
+      let val = s:replace(val, '${fileDirname}', '$(VIM_FILEDIR)')
+      let val = s:replace(val, '${fileExtname}', '$(VIM_FILEEXT)')
+      let val = s:replace(val, '${lineNumber}', '$(VIM_CLINE)')
+      " let val = s:replace(val, '${selectedText}', '$()') // Unavailable
+      " let val = s:replace(val, '${execPath}', '$()') // Unavailable
+
+      let val = s:replace(val, '$(VIM_INIHOME)', inihome)
+      let val = s:replace(val, '$(VIM_INIFILE)', ininame)
+      let section[key] = val
+    endfor
+  endfor
+  return obj
+endfunc
 
 "----------------------------------------------------------------------
 " check requirement
@@ -588,6 +690,25 @@ function! s:compose_local_config(path)
 	return config
 endfunc
 
+"----------------------------------------------------------------------
+" fetch local vscode config
+"----------------------------------------------------------------------
+function! s:compose_local_vscode_config(path)
+  let names = s:search_parent(g:asynctasks_vscode_config_name, a:path)
+  let config = {}
+  for name in names
+    let obj = s:cache_load_vscode_tasks_json(name)
+		if s:error == ''
+			call s:config_merge(config, obj.config, name, 'local')
+		else
+			call s:errmsg(s:error)
+			let s:error = ''
+		endif
+	endfor
+  let s:private.local_vscode.config = config
+  return config
+endfunc
+
 
 "----------------------------------------------------------------------
 " fetch all config
@@ -598,8 +719,9 @@ function! asynctasks#collect_config(path, force)
 	let s:error = ''
 	let c1 = s:compose_rtp_config(a:force)
 	let c2 = s:compose_local_config(path)
+  let c3 = s:compose_local_vscode_config(path)
 	let tasks = {'config':{}, 'names':{}, 'avail':[]}
-	for cc in [c1, c2]
+	for cc in [c1, c2, c3]
 		call s:config_merge(tasks.config, cc, '', '')
 	endfor
 	let avail = []
